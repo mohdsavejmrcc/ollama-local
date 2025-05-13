@@ -8,8 +8,17 @@ import json
 import base64
 
 # Ensure Tesseract is installed correctly in Colab
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Adjust this path if necessary
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+def is_docker():
+    return os.path.exists('/.dockerenv') or os.path.exists('/proc/1/cgroup')
+
+# Set Tesseract path based on environment
+if is_docker():
+    # Set the Docker-specific Tesseract path (you can install it inside the container)
+    pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'  # Path inside Docker container
+else:
+    # Set the local machine's Tesseract path
+    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"  # Adjust for local machine
+
 
 # Function to extract images and text from a PDF
 def extract_images_and_text_from_pdf(pdf_path):

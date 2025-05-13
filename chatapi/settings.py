@@ -82,7 +82,7 @@ DATABASES = {
         'NAME': 'db',  # Name of your MongoDB database
         'ENFORCE_SCHEMA': False,  # Set to False since MongoDB is schema-less
         'CLIENT': {
-            'host': 'mongodb://localhost:27017/',  # Local MongoDB connection
+            'host': 'mongodb://140.10.2.95:27017/mio_db',  # Local MongoDB connection
             'serverSelectionTimeoutMS': 5000,  # Timeout for server selection
         }
     }

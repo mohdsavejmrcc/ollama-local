@@ -21,12 +21,14 @@ from sentence_transformers import SentenceTransformer
 from langchain.text_splitter import SentenceTransformersTokenTextSplitter, RecursiveCharacterTextSplitter
 import hashlib
 import uuid
-
+from PIL import Image
+import pytesseract
 # Django specific imports
 from django.db import models
 from django.utils import timezone
 from django.db.models import Q
 import django
+import openai
 
 # Initialize Django settings
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "your_project.settings")
@@ -215,6 +217,19 @@ class DocumentQueryAssistant:
                             })
                             all_chunks.append(chunk)
 
+            elif file_extension.lower() in ['.png', '.jpg', '.jpeg']:
+                image = Image.open(file_path)
+                text_data = pytesseract.image_to_string(image)  # ✅ image is a PIL.Image.Image object
+
+
+                if text_data.strip():  # Check if OCR result is not empty
+                    txt_metadata = {
+                    **file_metadata,
+                    "source_type": "ocr"
+                    }
+                chunks = self.create_chunks(text_data, txt_metadata)
+                all_chunks.extend(chunks)
+
             elif file_extension == ".txt":
                 text_data = load_data(file_path)
                 for item in text_data:
@@ -367,22 +382,42 @@ class DocumentQueryAssistant:
             'initial_scores': initial_scores if initial_scores else None
         }
 
-    def generate_response(self, query: str, best_chunk: Dict):
-        """Generate response using Ollama"""
+    # def generate_response(self, query: str, best_chunk: Dict):
+    #     """Generate response using Ollama"""
+    #     best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
+    #     input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
+
+    #     try:
+    #         response = ollama.chat(
+    #             model=self.ollama_model, 
+    #             messages=[{"role": "user", "content": input_text}]
+    #         )
+            
+    #         return response['message']['content']
+    #     except Exception as e:
+    #         self.logger.error(f"Error generating response: {e}")
+    #         return "Unable to generate a response at this time."
+
+    def generate_response(self, query: str, best_chunk: dict):
+        """Generate response using OpenAI GPT-3.5"""
+        from openai import OpenAI
+        
+        client = OpenAI(api_key="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")
+        
         best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
         input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
-
+        
         try:
-            response = ollama.chat(
-                model=self.ollama_model, 
-                messages=[{"role": "user", "content": input_text}]
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",  # Minimal and cost-effective
+                messages=[{"role": "user", "content": input_text}],
+                temperature=0.7,
+                max_tokens=512,
             )
-            
-            return response['message']['content']
+            return response.choices[0].message.content
         except Exception as e:
             self.logger.error(f"Error generating response: {e}")
             return "Unable to generate a response at this time."
-
     def process_and_query(self, document_url: str, query: str, document_id: str = None, base_dir: Path = Path('./document_processing')):
         base_dir.mkdir(parents=True, exist_ok=True)
         
