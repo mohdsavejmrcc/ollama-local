@@ -2,8 +2,9 @@ import os
 import json
 import boto3
 import requests
+from pymongo import MongoClient
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urlparse
 import numpy as np
 import traceback
@@ -23,6 +24,13 @@ import hashlib
 import uuid
 from PIL import Image
 import pytesseract
+import tempfile
+import shutil
+import contextlib
+import threading
+import functools
+import time
+
 # Django specific imports
 from django.db import models
 from django.utils import timezone
@@ -38,34 +46,93 @@ django.setup()
 from myapi.models import Chunk
 
 
+class ModelCache:
+    """Singleton class to cache models and avoid reloading"""
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+                    cls._instance._initialized = False
+        return cls._instance
+    
+    def __init__(self):
+        if not self._initialized:
+            self._models = {}
+            self._initialized = True
+    
+    def get_embedding_model(self, model_name: str) -> SentenceTransformer:
+        """Get cached embedding model or load if not exists"""
+        if model_name not in self._models:
+            print(f"Loading embedding model: {model_name}")
+            self._models[model_name] = SentenceTransformer(model_name)
+        return self._models[model_name]
+
+
+def timing_decorator(func):
+    """Decorator to measure function execution time"""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} took {end_time - start_time:.2f} seconds")
+        return result
+    return wrapper
+
+
 class DocumentQueryAssistant:
     def __init__(self, 
                  chunk_size: int = 500, 
                  chunk_overlap: int = 50, 
                  embedding_model_name: str = "all-MiniLM-L6-v2",
-                 ollama_model: str = "mistral:latest"):
+                 ollama_model: str = "tinyllama:latest",
+                 max_cache_size: int = 1000):
         
         # Configure logging
         logging.basicConfig(level=logging.INFO, 
                             format='%(asctime)s - %(levelname)s - %(message)s')
         self.logger = logging.getLogger(__name__)
         
-        # Initialize embedding model
-        self.embedding_model = SentenceTransformer(embedding_model_name)
+        # Use cached model instance
+        self.model_cache = ModelCache()
+        self.embedding_model_name = embedding_model_name
         
-        # Initialize text splitters
-        self.token_splitter = SentenceTransformersTokenTextSplitter(
-            model_name=embedding_model_name,
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
-        )
-        self.backup_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap
-        )
+        # Lazy load embedding model (only when needed)
+        self._embedding_model = None
+        
+        # Initialize text splitters (lightweight)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self._token_splitter = None
+        self._backup_splitter = None
         
         # Ollama model for response generation
         self.ollama_model = ollama_model
+        
+        # MongoDB connection with connection pooling
+        self.mongo_client = MongoClient(
+            "mongodb://140.10.2.95:27017/",
+            maxPoolSize=10,
+            minPoolSize=1,
+            maxIdleTimeMS=30000,
+            waitQueueTimeoutMS=5000
+        )
+        self.mongo_db = self.mongo_client["mio_db"]
+        self.mongo_collection = self.mongo_db["embeddings"]
+        
+        # Create index for faster queries
+        try:
+            self.mongo_collection.create_index("file_name")
+        except Exception as e:
+            self.logger.warning(f"Index creation failed (might already exist): {e}")
+        
+        # In-memory cache for embeddings
+        self.embeddings_cache = {}
+        self.max_cache_size = max_cache_size
         
         # AWS S3 client
         try:
@@ -74,125 +141,202 @@ class DocumentQueryAssistant:
             self.logger.error(f"AWS S3 client initialization failed: {e}")
             self.s3_client = None
 
-    def load_existing_embeddings(self, document_id):
-        """Load existing embeddings from database for a specific document"""
-        try:
-            # Query the database for chunks with the document_id in metadata
-            chunks = Chunk.objects.filter(metadata__document_id=document_id)
-            
-            if chunks.exists():
-                # Convert Django QuerySet to list of dictionaries
-                chunks_data = []
-                for chunk in chunks:
-                    chunk_dict = {
-                        "chunk_id": chunk.chunk_id,
-                        "chunk_text": chunk.chunk_text,
-                        "embedding": chunk.embedding,
-                        "metadata": chunk.metadata,
-                        "document_id": document_id
-                    }
-                    chunks_data.append(chunk_dict)
-                return chunks_data
-            return None
-        except Exception as e:
-            self.logger.error(f"Error loading embeddings for document {document_id}: {e}")
-            return None
+    @property
+    def embedding_model(self) -> SentenceTransformer:
+        """Lazy load embedding model"""
+        if self._embedding_model is None:
+            self._embedding_model = self.model_cache.get_embedding_model(self.embedding_model_name)
+        return self._embedding_model
     
-    def save_embeddings(self, document_id, embeddings_data):
-        """Save embeddings for a specific document to database"""
+    @property
+    def token_splitter(self):
+        """Lazy load token splitter"""
+        if self._token_splitter is None:
+            self._token_splitter = SentenceTransformersTokenTextSplitter(
+                model_name=self.embedding_model_name,
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap
+            )
+        return self._token_splitter
+    
+    @property
+    def backup_splitter(self):
+        """Lazy load backup splitter"""
+        if self._backup_splitter is None:
+            self._backup_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=self.chunk_size,
+                chunk_overlap=self.chunk_overlap
+            )
+        return self._backup_splitter
+
+    @timing_decorator
+    def load_existing_embeddings(self, file_name: str) -> Optional[List[Dict]]:
+        """Load embeddings from cache or MongoDB using file_name"""
+        # Check in-memory cache first
+        if file_name in self.embeddings_cache:
+            self.logger.info(f"Loading embeddings from cache for: {file_name}")
+            return self.embeddings_cache[file_name]
+        
         try:
-            # Create or update chunks in the database
-            for chunk_data in embeddings_data:
-                # Set document_id in metadata if not already there
-                if not chunk_data.get("metadata"):
-                    chunk_data["metadata"] = {}
-                
-                chunk_data["metadata"]["document_id"] = document_id
-                
-                # Create new chunk in database
-                Chunk.objects.create(
-                    file_name=chunk_data["metadata"].get("file_name", ""),
-                    file_path=chunk_data["metadata"].get("file_path", ""),
-                    chunk_text=chunk_data["chunk_text"],
-                    page_number=chunk_data["metadata"].get("page_number"),
-                    embedding=chunk_data["embedding"],
-                    metadata=chunk_data["metadata"]
-                )
-                
-            self.logger.info(f"Saved {len(embeddings_data)} chunks for document {document_id}")
+            # Use projection to only get required fields
+            cursor = self.mongo_collection.find(
+                {"file_name": file_name},
+                {"chunk_text": 1, "embedding": 1, "metadata": 1, "_id": 0}
+            )
+            results = list(cursor)
+            
+            if results:
+                # Cache the results
+                self._update_cache(file_name, results)
+                self.logger.info(f"Loaded {len(results)} embeddings from MongoDB for: {file_name}")
+                return results
+            return None
         except Exception as e:
-            self.logger.error(f"Error saving embeddings for document {document_id}: {e}")
+            self.logger.error(f"Error loading embeddings from MongoDB: {e}")
+            return None
+
+    def _update_cache(self, file_name: str, embeddings: List[Dict]):
+        """Update in-memory cache with size limit"""
+        if len(self.embeddings_cache) >= self.max_cache_size:
+            # Remove oldest entry (simple FIFO)
+            oldest_key = next(iter(self.embeddings_cache))
+            del self.embeddings_cache[oldest_key]
+        
+        self.embeddings_cache[file_name] = embeddings
+
+    @timing_decorator
+    def save_embeddings(self, file_name: str, embeddings_data: List[Dict]):
+        """Save embeddings into MongoDB using file_name as unique key"""
+        try:
+            # Remove existing entries with the same file_name
+            self.mongo_collection.delete_many({"file_name": file_name})
+
+            # Prepare documents for bulk insert
+            documents = []
+            for chunk in embeddings_data:
+                doc = {
+                    "file_name": file_name,
+                    "chunk_text": chunk["chunk_text"],
+                    "embedding": chunk["embedding"],
+                    "metadata": chunk.get("metadata", {})
+                }
+                documents.append(doc)
+
+            # Bulk insert for better performance
+            if documents:
+                self.mongo_collection.insert_many(documents, ordered=False)
+                # Update cache
+                self._update_cache(file_name, embeddings_data)
+                self.logger.info(f"Saved {len(embeddings_data)} chunks for file_name: {file_name} into MongoDB")
+
+        except Exception as e:
+            self.logger.error(f"Error saving embeddings to MongoDB: {e}")
             self.logger.error(traceback.format_exc())
 
-    def download_file(self, url: str, local_path: Path):
-        """Download file from S3 or HTTP/HTTPS URL"""
+    @contextlib.contextmanager
+    def temporary_directory(self):
+        """Context manager for creating and cleaning up temporary directory"""
+        temp_dir = tempfile.mkdtemp(prefix="document_processing_")
+        try:
+            yield Path(temp_dir)
+        finally:
+            try:
+                shutil.rmtree(temp_dir)
+            except Exception as e:
+                self.logger.error(f"Error cleaning up temporary directory {temp_dir}: {e}")
+
+    @timing_decorator
+    def download_file_from_url(self, url: str, temp_dir: Path) -> Path:
+        """Download file from URL to temporary directory"""
         parsed_url = urlparse(url)
         
         if parsed_url.scheme == 's3':
-            return self.download_file_from_s3(url, local_path)
+            return self._download_from_s3_url(url, temp_dir)
         elif parsed_url.scheme in ['http', 'https']:
-            return self.download_file_from_http(url, local_path)
+            return self._download_from_http(url, temp_dir)
         else:
-            self.logger.error(f"Unsupported URL scheme: {parsed_url.scheme}")
-            return None
+            raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme}")
 
-   
-    def download_file_from_s3(self, s3_url: str, folder_name: str = "docs"):
-        """Download file from S3"""
+    def _download_from_s3_url(self, s3_url: str, temp_dir: Path) -> Path:
+        """Download file from S3 URL to temporary directory"""
         try:
             parsed_url = urlparse(s3_url)
             filename = os.path.basename(parsed_url.path)
-
-            folder_path = Path(folder_name)
-            folder_path.mkdir(parents=True, exist_ok=True)
-
-            file_path = folder_path / filename
-
+            
+            if not filename:
+                filename = f"downloaded_file_{uuid.uuid4().hex[:8]}"
+            
+            file_path = temp_dir / filename
+            
             response = requests.get(s3_url, stream=True)
             response.raise_for_status()
-
+            
             with open(file_path, "wb") as file:
                 for chunk in response.iter_content(chunk_size=8192):
-                    file.write(chunk)
-
-            print(f"File downloaded successfully: {file_path}")
-            return file_path
-        except Exception as e:
-            print(f"Error downloading file: {e}")
-            return None
+                    if chunk:
+                        file.write(chunk)
             
-    def download_file_from_http(self, url: str, local_path: Path):
-        """Download file from HTTP/HTTPS URL"""
+            return file_path
+            
+        except Exception as e:
+            self.logger.error(f"Error downloading from S3 URL {s3_url}: {e}")
+            raise
+
+    def _download_from_http(self, url: str, temp_dir: Path) -> Path:
+        """Download file from HTTP/HTTPS URL to temporary directory"""
         try:
-            response = requests.get(url)
+            parsed_url = urlparse(url)
+            filename = os.path.basename(parsed_url.path)
+            
+            if not filename or '.' not in filename:
+                filename = f"downloaded_file_{uuid.uuid4().hex[:8]}"
+                
+                response_head = requests.head(url, allow_redirects=True)
+                content_disposition = response_head.headers.get('Content-Disposition', '')
+                if 'filename=' in content_disposition:
+                    filename = content_disposition.split('filename=')[1].strip('"\'')
+            
+            file_path = temp_dir / filename
+            
+            response = requests.get(url, stream=True)
             response.raise_for_status()
             
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(local_path, 'wb') as f:
-                f.write(response.content)
-            return local_path
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            
+            return file_path
+            
         except Exception as e:
-            self.logger.error(f"Error downloading file from URL: {e}")
-            return None
+            self.logger.error(f"Error downloading from HTTP URL {url}: {e}")
+            raise
+
+    def download_file_from_s3_direct(self, bucket: str, key: str, temp_dir: Path) -> Path:
+        """Download file directly from S3 using boto3"""
+        try:
+            if not self.s3_client:
+                raise Exception("S3 client not initialized")
+            
+            filename = os.path.basename(key)
+            if not filename:
+                filename = f"s3_file_{uuid.uuid4().hex[:8]}"
+            
+            file_path = temp_dir / filename
+            
+            self.s3_client.download_file(bucket, key, str(file_path))
+            return file_path
+            
+        except Exception as e:
+            self.logger.error(f"Error downloading from S3 bucket {bucket}, key {key}: {e}")
+            raise
 
     def generate_document_id(self, file_name: str, document_url: str) -> str:
         """Generate a unique document ID"""
         unique_string = f"{file_name}|{document_url}"
         return hashlib.md5(unique_string.encode()).hexdigest()
 
-    def process_document_from_url(self, url: str, download_dir: Path) -> List[Dict]:
-        """Download and process a document based on URL"""
-        parsed_url = urlparse(url)
-        file_name = os.path.basename(parsed_url.path)
-        file_path = download_dir / file_name
-        
-        downloaded_file = self.download_file(url, file_path)
-        if not downloaded_file:
-            self.logger.error("Failed to download file")
-            return []
-        
-        return self.process_document(downloaded_file)
-
+    @timing_decorator
     def process_document(self, file_path: Path) -> List[Dict]:
         """Process document based on file type"""
         file_extension = file_path.suffix.lower()
@@ -217,18 +361,17 @@ class DocumentQueryAssistant:
                             })
                             all_chunks.append(chunk)
 
-            elif file_extension.lower() in ['.png', '.jpg', '.jpeg']:
+            elif file_extension.lower() in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif']:
                 image = Image.open(file_path)
-                text_data = pytesseract.image_to_string(image)  # ✅ image is a PIL.Image.Image object
+                text_data = pytesseract.image_to_string(image)
 
-
-                if text_data.strip():  # Check if OCR result is not empty
+                if text_data.strip():
                     txt_metadata = {
-                    **file_metadata,
-                    "source_type": "ocr"
+                        **file_metadata,
+                        "source_type": "ocr"
                     }
-                chunks = self.create_chunks(text_data, txt_metadata)
-                all_chunks.extend(chunks)
+                    chunks = self.create_chunks(text_data, txt_metadata)
+                    all_chunks.extend(chunks)
 
             elif file_extension == ".txt":
                 text_data = load_data(file_path)
@@ -242,8 +385,7 @@ class DocumentQueryAssistant:
                         chunks = self.create_chunks(item["text"], txt_metadata)
                         all_chunks.extend(chunks)
 
-            # Add similar processing for other file types like HTML, DOCX, XML, etc.
-            elif file_extension == ".html":
+            elif file_extension in [".html", ".htm"]:
                 html_data = parse_html(file_path)
                 for item in html_data:
                     if item.get("text"):
@@ -290,10 +432,12 @@ class DocumentQueryAssistant:
                         }
                         chunks = self.create_chunks(item["text"], xml_metadata)
                         all_chunks.extend(chunks)
+            else:
+                self.logger.warning(f"Unsupported file extension: {file_extension}")
 
         except Exception as e:
             self.logger.error(f"Error processing {file_path}: {e}")
-            print(traceback.format_exc())
+            self.logger.error(traceback.format_exc())
 
         return all_chunks
 
@@ -305,7 +449,7 @@ class DocumentQueryAssistant:
                 metadatas=[metadata]
             )
         except Exception as e:
-            print(f"Falling back to recursive splitter due to: {e}")
+            self.logger.warning(f"Falling back to recursive splitter due to: {e}")
             chunks = self.backup_splitter.create_documents(
                 texts=[text],
                 metadatas=[metadata]
@@ -316,160 +460,175 @@ class DocumentQueryAssistant:
             "metadata": chunk.metadata
         } for chunk in chunks]
 
+    @timing_decorator
     def generate_embeddings(self, chunks: List[Dict]) -> List[Dict]:
-        """Generate embeddings for text chunks"""
-        for chunk in chunks:
-            chunk['embedding'] = self.embedding_model.encode(
-                chunk['chunk_text'], 
-                convert_to_numpy=True
-            ).tolist()
+        """Generate embeddings for text chunks with batch processing"""
+        if not chunks:
+            return chunks
+            
+        # Extract texts for batch processing
+        texts = [chunk['chunk_text'] for chunk in chunks]
+        
+        # Generate embeddings in batch (much faster than one-by-one)
+        embeddings = self.embedding_model.encode(
+            texts, 
+            convert_to_numpy=True,
+            show_progress_bar=True,
+            batch_size=32  # Adjust based on your memory
+        )
+        
+        # Assign embeddings back to chunks
+        for i, chunk in enumerate(chunks):
+            chunk['embedding'] = embeddings[i].tolist()
+            
         return chunks
 
-    def cosine_similarity(self, vec1, vec2):
-        """Calculate cosine similarity between two vectors"""
-        return 1 - cosine(vec1, vec2)
-
-    def select_relevant_chunks(self, query: str, embeddings_data: List[Dict], top_k: int = 5):
-        """Select top relevant chunks based on query"""
-        query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
-        similarities = []
-
-        for chunk in embeddings_data:
-            chunk_embedding = np.array(chunk.get("embedding", []))
-            if chunk_embedding.size == 0:
-                continue
-
-            sim = self.cosine_similarity(query_embedding, chunk_embedding)
-            similarities.append((chunk, sim))
-
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return [(chunk, score) for chunk, score in similarities[:top_k]]
-    
-
-    def rerank_results(self, query_embedding, retrieved_chunks):
-        """Ranks retrieved chunks based on similarity and length."""
-        # Unpack chunks and scores if they're provided as tuples
-        if isinstance(retrieved_chunks[0], tuple):
-            chunks_only = [chunk for chunk, _ in retrieved_chunks]
-            initial_scores = [score for _, score in retrieved_chunks]
-        else:
-            chunks_only = retrieved_chunks
-            initial_scores = []
+    @timing_decorator
+    def cosine_similarity_batch(self, query_embedding: np.ndarray, chunk_embeddings: np.ndarray) -> np.ndarray:
+        """Vectorized cosine similarity calculation for batch processing"""
+        # Normalize vectors for efficient cosine similarity
+        query_norm = query_embedding / np.linalg.norm(query_embedding)
+        chunk_norms = chunk_embeddings / np.linalg.norm(chunk_embeddings, axis=1, keepdims=True)
         
-        retrieved_embeddings = [np.array(chunk["embedding"]) for chunk in chunks_only if "embedding" in chunk]
-        similarities = [self.cosine_similarity(query_embedding, emb) for emb in retrieved_embeddings]
-        chunk_lengths = [len(chunk["chunk_text"]) for chunk in chunks_only]
+        # Compute cosine similarity using dot product
+        similarities = np.dot(chunk_norms, query_norm)
+        return similarities
 
-        # Normalize scores safely
-        max_sim, min_sim = max(similarities, default=1), min(similarities, default=0)
-        similarities_normalized = [(sim - min_sim) / (max_sim - min_sim + 1e-9) for sim in similarities]
+    @timing_decorator
+    def select_relevant_chunks(self, query: str, embeddings_data: List[Dict], top_k: int = 5):
+        """Optimized chunk selection using vectorized operations"""
+        if not embeddings_data:
+            return []
+            
+        query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
+        
+        # Extract embeddings and create numpy array for vectorized operations
+        valid_chunks = []
+        chunk_embeddings_list = []
+        
+        for chunk in embeddings_data:
+            if "embedding" in chunk and chunk["embedding"]:
+                valid_chunks.append(chunk)
+                chunk_embeddings_list.append(np.array(chunk["embedding"]))
+        
+        if not chunk_embeddings_list:
+            return []
+        
+        # Stack embeddings for batch processing
+        chunk_embeddings = np.stack(chunk_embeddings_list)
+        
+        # Compute similarities in batch
+        similarities = self.cosine_similarity_batch(query_embedding, chunk_embeddings)
+        
+        # Get top k indices
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        
+        # Return top chunks with scores
+        return [(valid_chunks[i], similarities[i]) for i in top_indices]
 
-        max_length, min_length = max(chunk_lengths, default=1), min(chunk_lengths, default=0)
-        chunk_lengths_normalized = [(l - min_length) / (max_length - min_length + 1e-9) for l in chunk_lengths]
+    def rerank_results(self, query_embedding: np.ndarray, retrieved_chunks: List[Tuple]):
+        """Optimized reranking with vectorized operations"""
+        if not retrieved_chunks:
+            return None, [], {}
+            
+        # Unpack chunks and scores
+        chunks_only = [chunk for chunk, _ in retrieved_chunks]
+        initial_scores = [score for _, score in retrieved_chunks]
+        
+        # Extract embeddings and similarities
+        embeddings = np.array([chunk["embedding"] for chunk in chunks_only])
+        similarities = self.cosine_similarity_batch(query_embedding, embeddings)
+        
+        chunk_lengths = np.array([len(chunk["chunk_text"]) for chunk in chunks_only])
 
-        combined_scores = [(sim + l) / 2 for sim, l in zip(similarities_normalized, chunk_lengths_normalized)]
+        # Vectorized normalization
+        similarities_normalized = (similarities - similarities.min()) / (similarities.max() - similarities.min() + 1e-9)
+        lengths_normalized = (chunk_lengths - chunk_lengths.min()) / (chunk_lengths.max() - chunk_lengths.min() + 1e-9)
+        
+        combined_scores = (similarities_normalized + lengths_normalized) / 2
 
-        # Sort by score
+        # Sort by combined scores
         sorted_indices = np.argsort(combined_scores)[::-1]
         sorted_chunks = [chunks_only[i] for i in sorted_indices]
-        sorted_scores = [combined_scores[i] for i in sorted_indices]
-        sorted_similarities = [similarities[i] for i in sorted_indices]
-
-        # Return best chunk, all sorted chunks, and all score information
+        
         return sorted_chunks[0], sorted_chunks, {
-            'combined_scores': sorted_scores,
-            'similarity_scores': sorted_similarities,
-            'initial_scores': initial_scores if initial_scores else None
+            'combined_scores': combined_scores[sorted_indices].tolist(),
+            'similarity_scores': similarities[sorted_indices].tolist(),
+            'initial_scores': initial_scores
         }
 
-    # def generate_response(self, query: str, best_chunk: Dict):
-    #     """Generate response using Ollama"""
-    #     best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
-    #     input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
-
-    #     try:
-    #         response = ollama.chat(
-    #             model=self.ollama_model, 
-    #             messages=[{"role": "user", "content": input_text}]
-    #         )
-            
-    #         return response['message']['content']
-    #     except Exception as e:
-    #         self.logger.error(f"Error generating response: {e}")
-    #         return "Unable to generate a response at this time."
-
-    def generate_response(self, query: str, best_chunk: dict):
-        """Generate response using OpenAI GPT-3.5"""
-        from openai import OpenAI
-        
-        client = OpenAI(api_key="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")
-        
+    @timing_decorator
+    def generate_response(self, query: str, best_chunk: Dict):
+        """Generate response using Ollama"""
         best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
         input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
-        
+
         try:
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",  # Minimal and cost-effective
-                messages=[{"role": "user", "content": input_text}],
-                temperature=0.7,
-                max_tokens=512,
+            response = ollama.chat(
+                model=self.ollama_model, 
+                messages=[{"role": "user", "content": input_text}]
             )
-            return response.choices[0].message.content
+            
+            return response['message']['content']
         except Exception as e:
             self.logger.error(f"Error generating response: {e}")
             return "Unable to generate a response at this time."
-    def process_and_query(self, document_url: str, query: str, document_id: str = None, base_dir: Path = Path('./document_processing')):
-        base_dir.mkdir(parents=True, exist_ok=True)
+
+    @timing_decorator
+    def process_and_query(self, document_url: str, query: str, document_id: str = None, 
+                         output_dir: Path = None, base_dir: Path = None, 
+                         save_output_file: bool = False, top_k: int = 5):
+        """Optimized document processing and querying"""
+        # Handle backward compatibility
+        if base_dir is not None:
+            output_dir = base_dir
+        elif output_dir is None:
+            output_dir = Path('./document_processing')
+            
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         try:
-            # Generate document_id if not provided
-            if not document_id and document_url:
-                file_name = os.path.basename(urlparse(document_url).path)
-                document_id = self.generate_document_id(file_name, document_url)
-            
-            if not document_id:
-                self.logger.error("No document_id provided and couldn't generate one from URL.")
+            # Generate file_name from URL
+            file_name = os.path.basename(urlparse(document_url).path)
+            if not file_name:
+                self.logger.error("Unable to determine file_name from URL.")
                 return None
+                        
+            # Try to load existing embeddings first
+            embeddings_with_metadata = self.load_existing_embeddings(file_name)
             
-            # Try to load existing embeddings from database
-            embeddings_with_metadata = self.load_existing_embeddings(document_id)
+            # If no existing embeddings, process document
+            if not embeddings_with_metadata:
+                if not document_url:
+                    self.logger.error("No document_url provided and no existing data found.")
+                    return None
+
+                with self.temporary_directory() as temp_dir:
+                    local_file_path = self.download_file_from_url(document_url, temp_dir)
+                    
+                    chunks = self.process_document(local_file_path)
+                    if not chunks:
+                        self.logger.warning("No chunks created from the document.")
+                        return None
+
+                    embeddings_with_metadata = self.generate_embeddings(chunks)
+                    self.save_embeddings(file_name, embeddings_with_metadata)
             
-            # If embeddings don't exist in database, process the document and store in database
-            if embeddings_with_metadata:
-                self.logger.info(f"Using existing embeddings for document_id: {document_id}")
-            elif document_url:
-                file_name = os.path.basename(urlparse(document_url).path)
-                local_file_path = base_dir / file_name
-                local_file = self.download_file(document_url, local_file_path)
-                
-                if not local_file:
-                    self.logger.error("Document download failed.")
-                    return None
-                
-                print(f"File downloaded successfully: {local_file}")
-                
-                chunks = self.process_document(local_file)
-                if not chunks:
-                    self.logger.warning("No chunks created from the document.")
-                    return None
-                
-                embeddings_with_metadata = self.generate_embeddings(chunks)
-                
-                # Save embeddings to database
-                self.save_embeddings(document_id, embeddings_with_metadata)
-            else:
-                self.logger.error("No existing embeddings found and no document_url provided to download.")
-                return None
-        
-            # Select relevant chunks for the query
-            chunks_with_scores = self.select_relevant_chunks(query, embeddings_with_metadata)
+            # Process query with existing embeddings
+            chunks_with_scores = self.select_relevant_chunks(query, embeddings_with_metadata, top_k)
+            
+            if not chunks_with_scores:
+                return {
+                    'response': "No relevant information found.",
+                    'relevant_chunks': [],
+                    'similarity_scores': [],
+                    'reranked_chunks': [],
+                    'score_details': {},
+                    'document_id': document_id
+                }
+            
             relevant_chunks = [chunk for chunk, _ in chunks_with_scores]
-            similarity_scores = [score for _, score in chunks_with_scores]
-            
-            # Validate chunk content
-            for chunk in relevant_chunks:
-                if "chunk_text" not in chunk or not chunk["chunk_text"]:
-                    self.logger.warning(f"Missing chunk_text in chunk: {chunk.get('chunk_id', 'unknown')}")
+            similarity_scores = [float(score) for _, score in chunks_with_scores]
             
             # Rerank results
             query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
@@ -488,12 +647,12 @@ class DocumentQueryAssistant:
                 'document_id': document_id
             }
             
-            # Save output to file (optional, could be removed in production)
-            output_file = base_dir / "output.json"
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(output_data, f, indent=4, ensure_ascii=False)
+            # Save output to file if requested
+            if save_output_file:
+                output_file = output_dir / "output.json"
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    json.dump(output_data, f, indent=4, ensure_ascii=False, default=str)
 
-            print(f"Output saved to {output_file}")
             return output_data
         
         except Exception as e:
@@ -501,21 +660,31 @@ class DocumentQueryAssistant:
             self.logger.error(traceback.format_exc())
             return None
 
+    def clear_cache(self):
+        """Clear in-memory cache"""
+        self.embeddings_cache.clear()
+        self.logger.info("Cache cleared")
+
+    def get_cache_info(self):
+        """Get cache statistics"""
+        return {
+            "cache_size": len(self.embeddings_cache),
+            "cached_files": list(self.embeddings_cache.keys())
+        }
+
+
 if __name__ == "__main__":
-        assistant = DocumentQueryAssistant()
-        result = assistant.process_and_query(
-            document_url="",
-            query="Tell me about about Interest Payments ?",
-            document_id="e57d7a745e68382c99e4a742b82bbf1b"
-        )
-        
-        if result:
-            print("\nResponse:", result['response'])
-            print("\nRelevant Chunks:")
-            for i, (chunk, score) in enumerate(zip(result['relevant_chunks'], result['similarity_scores'])):
-                print(f"Chunk {i+1} (Similarity Score: {score:.4f}) ---")
-                print("\nChunk Text:", chunk.get('chunk_text', 'No text available'))
-                print("\nMetadata:")
-                metadata = chunk.get('metadata', {})
-                for key, value in metadata.items():
-                    print(f"  {key}: {value}")
+    assistant = OptimizedDocumentQueryAssistant()
+    result = assistant.process_and_query(
+        document_url="",
+        query="Tell me about Interest Payments?",
+        document_id="e57d7a745e68382c99e4a742b82bbf1b"
+    )
+    
+    if result:
+        print("\nResponse:", result['response'])
+        print(f"\nFound {len(result['relevant_chunks'])} relevant chunks")
+        print("\nTop 3 Chunks:")
+        for i, (chunk, score) in enumerate(zip(result['relevant_chunks'][:3], result['similarity_scores'][:3])):
+            print(f"\nChunk {i+1} (Similarity Score: {score:.4f})")
+            print("Text preview:", chunk.get('chunk_text', 'No text')[:200] + "...")
