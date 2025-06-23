@@ -673,18 +673,5 @@ class DocumentQueryAssistant:
         }
 
 
-if __name__ == "__main__":
-    assistant = OptimizedDocumentQueryAssistant()
-    result = assistant.process_and_query(
-        document_url="",
-        query="Tell me about Interest Payments?",
-        document_id="e57d7a745e68382c99e4a742b82bbf1b"
-    )
+
     
-    if result:
-        print("\nResponse:", result['response'])
-        print(f"\nFound {len(result['relevant_chunks'])} relevant chunks")
-        print("\nTop 3 Chunks:")
-        for i, (chunk, score) in enumerate(zip(result['relevant_chunks'][:3], result['similarity_scores'][:3])):
-            print(f"\nChunk {i+1} (Similarity Score: {score:.4f})")
-            print("Text preview:", chunk.get('chunk_text', 'No text')[:200] + "...")

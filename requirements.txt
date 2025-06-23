@@ -104,6 +104,7 @@ onnx==1.17.0
 onnxruntime==1.20.1
 openai==1.78.0	
 opencv-python==4.11.0.86
+django-cors-headers
 openpyxl==3.1.5
 orjson==3.10.15
 packaging==24.2
