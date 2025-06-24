@@ -33,11 +33,15 @@ import time
 
 # Django specific imports
 from django.db import models
+from typing import Generator
 from django.utils import timezone
 from django.db.models import Q
 import django
 import openai
-
+from django.views.decorators.csrf import csrf_exempt
+from django.http import JsonResponse, StreamingHttpResponse, HttpResponseNotAllowed
+from chatapi.socket_server import sio
+from asgiref.sync import async_to_sync
 # Initialize Django settings
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "your_project.settings")
 django.setup()
@@ -557,24 +561,41 @@ class DocumentQueryAssistant:
             'initial_scores': initial_scores
         }
 
+
     @timing_decorator
-    def generate_response(self, query: str, best_chunk: Dict):
+    @csrf_exempt
+    def generate_response(self, query: str,conversation_id, best_chunk: Dict,stream=True):
         """Generate response using Ollama"""
         best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
         input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
+        if stream:
+            def stream_generator():
+                try:
+                        stream_response = ollama.chat(
+                            model=self.ollama_model,
+                            messages=[{"role": "user", "content": input_text}],
+                            stream=True
+                        )
 
-        try:
-            response = ollama.chat(
-                model=self.ollama_model, 
-                messages=[{"role": "user", "content": input_text}]
-            )
-            
-            return response['message']['content']
-        except Exception as e:
-            self.logger.error(f"Error generating response: {e}")
-            return "Unable to generate a response at this time."
+                        for chunk in stream_response:
+                            content = chunk.get("message", {}).get("content", "")
+                            if content:
+                                data = {"chunk": content}
+                                async_to_sync(sio.emit)(f"chunk:{conversation_id}", data)
+                                yield f"data: {json.dumps(data)}\n\n"
+
+                        async_to_sync(sio.emit)(f"done:{conversation_id}", {'status': 'complete'})
+
+                except Exception as e:
+                        error_msg = str(e)
+                        self.logger.exception("Streaming error in generate_response")
+                        async_to_sync(sio.emit)(f"error:{conversation_id}", {'error': error_msg})
+                        yield f"data: {json.dumps({'error': error_msg})}\n\n"
+
+                return StreamingHttpResponse(stream_generator(), content_type='text/event-stream', charset='utf-8')
 
     @timing_decorator
+    @csrf_exempt
     def process_and_query(self, document_url: str, query: str, document_id: str = None, 
                          output_dir: Path = None, base_dir: Path = None, 
                          save_output_file: bool = False, top_k: int = 5):
@@ -635,7 +656,7 @@ class DocumentQueryAssistant:
             best_chunk, reranked_chunks, score_details = self.rerank_results(query_embedding, chunks_with_scores)
             
             # Generate response
-            response = self.generate_response(query, best_chunk) if best_chunk else "No relevant information found."
+            response = self.generate_response(query, best_chunk,conversation_id=document_id) if best_chunk else "No relevant information found."
         
             # Prepare output data
             output_data = {
@@ -659,6 +680,7 @@ class DocumentQueryAssistant:
             self.logger.error(f"Error in document processing and querying: {e}")
             self.logger.error(traceback.format_exc())
             return None
+
 
     def clear_cache(self):
         """Clear in-memory cache"""

@@ -33,4 +33,5 @@ from myapi import views
 urlpatterns = [
     path("", lambda request: HttpResponseRedirect("/process_query/")),  # Redirect base URL
     path("process_query/", views.process_query, name="process_query"),
+     path("process_query_stream/", views.stream_query_view,name='stream_query_view')
 ]

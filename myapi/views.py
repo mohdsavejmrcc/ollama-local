@@ -1,10 +1,11 @@
 from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
 import json
 import logging
 from pathlib import Path
 from .ingests.chat8 import DocumentQueryAssistant  # Import the class
-
+from django.http import StreamingHttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_POST
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -83,3 +84,31 @@ def process_query(request):
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return JsonResponse({"error": f"An error occurred: {str(e)}"}, status=500)
+    
+processor = DocumentQueryAssistant()
+
+@csrf_exempt
+@require_POST
+def stream_query_view(request):
+    try:
+        data = json.loads(request.body)
+        query = data.get("query")
+        document_url = data.get("document_url")
+        document_id = data.get("document_id")
+
+        if not query or not document_url:
+            return JsonResponse({"error": "Missing required params"}, status=400)
+
+        generator = processor.process_and_query_stream(
+            document_url=document_url,
+            query=query,
+            document_id=document_id
+        )
+
+        return StreamingHttpResponse(
+            streaming_content=generator,
+            content_type="text/event-stream"
+        )
+
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
