@@ -1,15 +1,3 @@
-from django.http import JsonResponse,StreamingHttpResponse
-from django.views.decorators.csrf import csrf_exempt
-import json
-import logging
-from pathlib import Path
-from .ingests.chat8 import DocumentQueryAssistant  # Import the class
-from asgiref.sync import sync_to_async  # optional, for async safety
-
-# Set up logging
-logger = logging.getLogger(__name__)
-
-
 @csrf_exempt
 def process_query(request):
     if request.method != "POST":
@@ -39,17 +27,14 @@ def process_query(request):
                     query=query_text,
                     document_id=document_id,
                     base_dir=base_dir,
-                    stream=True
+                    stream=True  # ✅ Enable streaming
                 ):
-                    yield token + "\n"
+                    yield token
             except Exception as e:
                 logger.error(f"Streaming error: {e}", exc_info=True)
-                yield "[ERROR]: Streaming failed.\n"
+                yield "\n[Error streaming response]\n"
 
-        response = StreamingHttpResponse(stream_response(), content_type="text/plain")
-        response['Cache-Control'] = 'no-cache'
-        response['X-Accel-Buffering'] = 'no'
-        return response
+        return StreamingHttpResponse(stream_response(), content_type="text/plain")
 
     except json.JSONDecodeError:
         logger.error("Invalid JSON received", exc_info=True)
@@ -57,3 +42,5 @@ def process_query(request):
     except Exception as e:
         logger.error(f"Unexpected error: {e}", exc_info=True)
         return JsonResponse({"error": f"An error occurred: {str(e)}"}, status=500)
+    
+    

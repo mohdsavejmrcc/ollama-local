@@ -21,6 +21,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-x37)d)66)3@7fr@qg#kkf)i)qxy8sp!v)7g*hc!2!k!gff9-6a'
+# settings.py
+
+JWT_SECRET = 'sdfsdfsdhfds'  # Must exactly match the secret used in your Node.js backend
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = False
@@ -120,7 +123,8 @@ USE_I18N = True
 
 USE_TZ = True
 
-
+MONGO_URI = "mongodb://140.10.2.95:27017"  # or your full connection string
+MONGO_DB_NAME = "mio_db"
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/
 
@@ -132,7 +136,8 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",  # Allow requests from your frontend
+    "http://localhost:5173",
+       "http://localhost:5174"  # Allow requests from your frontend
 ]
 CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
 CORS_ALLOW_HEADERS = ["*"]

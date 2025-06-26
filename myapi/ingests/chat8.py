@@ -89,7 +89,7 @@ class DocumentQueryAssistant:
                  chunk_size: int = 500, 
                  chunk_overlap: int = 50, 
                  embedding_model_name: str = "all-MiniLM-L6-v2",
-                 ollama_model: str = "tinyllama:latest",
+                 ollama_model: str = "mistral:7b-instruct-q2_k",
                  max_cache_size: int = 1000):
         
         # Configure logging
@@ -557,108 +557,90 @@ class DocumentQueryAssistant:
             'initial_scores': initial_scores
         }
 
-    @timing_decorator
-    def generate_response(self, query: str, best_chunk: Dict):
-        """Generate response using Ollama"""
+    def generate_response_stream(self, query: str, best_chunk: dict):
         best_text = best_chunk.get("chunk_text", "") if isinstance(best_chunk, dict) else str(best_chunk)
         input_text = f"Query: {query}\nRelevant Context: {best_text}\nAnswer:"
 
         try:
-            response = ollama.chat(
-                model=self.ollama_model, 
-                messages=[{"role": "user", "content": input_text}]
-            )
-            
-            return response['message']['content']
+            for chunk in ollama.chat(
+                model=self.ollama_model,
+                messages=[{"role": "user", "content": input_text}],
+                stream=True
+            ):
+                yield chunk["message"]["content"]
         except Exception as e:
-            self.logger.error(f"Error generating response: {e}")
-            return "Unable to generate a response at this time."
+            self.logger.error(f"Error streaming response: {e}")
+            yield "[Error generating response]"
 
-    @timing_decorator
-    def process_and_query(self, document_url: str, query: str, document_id: str = None, 
-                         output_dir: Path = None, base_dir: Path = None, 
-                         save_output_file: bool = False, top_k: int = 5):
-        """Optimized document processing and querying"""
-        # Handle backward compatibility
+    def process_and_query(self, document_url: str, query: str, document_id: str = None,
+                          output_dir: Path = None, base_dir: Path = None,
+                          save_output_file: bool = False, top_k: int = 5, stream: bool = False):
+
         if base_dir is not None:
             output_dir = base_dir
         elif output_dir is None:
             output_dir = Path('./document_processing')
-            
+
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         try:
-            # Generate file_name from URL
             file_name = os.path.basename(urlparse(document_url).path)
             if not file_name:
-                self.logger.error("Unable to determine file_name from URL.")
-                return None
-                        
-            # Try to load existing embeddings first
-            embeddings_with_metadata = self.load_existing_embeddings(file_name)
-            
-            # If no existing embeddings, process document
-            if not embeddings_with_metadata:
-                if not document_url:
-                    self.logger.error("No document_url provided and no existing data found.")
-                    return None
+                return iter(["Document name is missing."]) if stream else {"response": "Document name is missing."}
 
+            embeddings_with_metadata = self.load_existing_embeddings(file_name)
+
+            if not embeddings_with_metadata:
                 with self.temporary_directory() as temp_dir:
                     local_file_path = self.download_file_from_url(document_url, temp_dir)
-                    
                     chunks = self.process_document(local_file_path)
                     if not chunks:
-                        self.logger.warning("No chunks created from the document.")
-                        return None
+                        return iter(["No chunks created."]) if stream else {"response": "No chunks created."}
 
                     embeddings_with_metadata = self.generate_embeddings(chunks)
                     self.save_embeddings(file_name, embeddings_with_metadata)
-            
-            # Process query with existing embeddings
+
             chunks_with_scores = self.select_relevant_chunks(query, embeddings_with_metadata, top_k)
-            
             if not chunks_with_scores:
-                return {
+                return iter(["No relevant information found."]) if stream else {
                     'response': "No relevant information found.",
-                    'relevant_chunks': [],
-                    'similarity_scores': [],
-                    'reranked_chunks': [],
-                    'score_details': {},
-                    'document_id': document_id
+                    'relevant_chunks': [], 'similarity_scores': [],
+                    'reranked_chunks': [], 'score_details': {}, 'document_id': document_id
                 }
-            
+
             relevant_chunks = [chunk for chunk, _ in chunks_with_scores]
             similarity_scores = [float(score) for _, score in chunks_with_scores]
-            
-            # Rerank results
+
             query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
             best_chunk, reranked_chunks, score_details = self.rerank_results(query_embedding, chunks_with_scores)
-            
-            # Generate response
+
+            if stream:
+                return self.generate_response_stream(query, best_chunk) if best_chunk else iter(["No relevant information found."])
+
             response = self.generate_response(query, best_chunk) if best_chunk else "No relevant information found."
-        
-            # Prepare output data
             output_data = {
-                'response': response, 
+                'response': response,
                 'relevant_chunks': relevant_chunks,
                 'similarity_scores': similarity_scores,
                 'reranked_chunks': reranked_chunks,
                 'score_details': score_details,
                 'document_id': document_id
             }
-            
-            # Save output to file if requested
+
             if save_output_file:
                 output_file = output_dir / "output.json"
                 with open(output_file, 'w', encoding='utf-8') as f:
                     json.dump(output_data, f, indent=4, ensure_ascii=False, default=str)
 
             return output_data
-        
+
         except Exception as e:
             self.logger.error(f"Error in document processing and querying: {e}")
             self.logger.error(traceback.format_exc())
-            return None
+            return iter(["[Error occurred during processing]"]) if stream else {
+                'response': "An error occurred during processing.",
+                'document_id': document_id
+            }
 
     def clear_cache(self):
         """Clear in-memory cache"""
